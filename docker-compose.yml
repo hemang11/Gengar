@@ -1,0 +1,113 @@
+version: "3.9"
+
+services:
+  # ── Redis (internal only) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - gengar-net
+    volumes:
+      - redis-data:/data
+
+  # ── Rotation Engine (internal FastAPI) ──────────────────────
+  rotation-engine:
+    build: ./rotation-engine
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - gengar-net
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Proxy Scraper ──────────────────────────────────────────
+  proxy-scraper:
+    build: ./proxy-scraper
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      rotation-engine:
+        condition: service_healthy
+    networks:
+      - gengar-net
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Gateway (HTTP proxy – exposed on 8080) ─────────────────
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "6969:6969"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rotation-engine:
+        condition: service_healthy
+    networks:
+      - gengar-net
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6969/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── API Server (FastAPI + WebSocket – exposed on 8000) ─────
+  api-server:
+    build: ./api-server
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rotation-engine:
+        condition: service_healthy
+    networks:
+      - gengar-net
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Web UI (React – exposed on 3000) ───────────────────────
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      api-server:
+        condition: service_healthy
+    networks:
+      - gengar-net
+
+networks:
+  gengar-net:
+    driver: bridge
+
+volumes:
+  redis-data:
