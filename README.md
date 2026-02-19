@@ -5,9 +5,11 @@ A self-hosted rotating proxy provider named after the ghost Pokémon. Slippery, 
 Gengar handles automatic IP rotation through a pool of ~100 healthy free proxies. Your scrapers point to Gengar's gateway (port 6969), and it takes care of the rest: scraping, health checking, rotation strategies, and block detection.
 
 <div align="center">
-  <img src="assets/live-traffic.png" alt="Live Traffic" width="30%" />
-  <img src="assets/pool-health.png" alt="Pool Health" width="30%" />
-  <img src="assets/rotation-rules.png" alt="Rotation Rules" width="30%" />
+  <img src="assets/live-traffic.png" alt="Live Traffic" />
+  <br/><br/>
+  <img src="assets/pool-health.png" alt="Pool Health" />
+  <br/><br/>
+  <img src="assets/rotation-rules.png" alt="Rotation Rules" />
 </div>
 
 ## 🚀 Quick Start
