@@ -60,10 +60,12 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
 PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=https",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
 ]
 
 # Webshare fallback (optional)
@@ -75,6 +77,7 @@ MIN_POOL_SIZE = int(os.getenv("MIN_POOL_SIZE", "20"))
 
 PROXY_KEY_PREFIX = "gengar:proxy:"
 POOL_INDEX_KEY = "gengar:pool:index"
+HEALTHY_SET_KEY = "gengar:pool:healthy"
 
 IP_PORT_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})$")
 
@@ -217,6 +220,8 @@ async def scrape_and_store(redis: aioredis.Redis) -> dict:
         # Only add if not already in pool (preserve existing stats)
         pipe.setnx(redis_key, json.dumps(p))
         pipe.sadd(POOL_INDEX_KEY, addr)
+        # We don't add to healthy set here; we let the check_all_proxies do it
+        # UNLESS it's the first time and we want them available? No, safer to wait.
     await pipe.execute()
 
     # Run health checks on all
@@ -242,6 +247,7 @@ async def scrape_and_store(redis: aioredis.Redis) -> dict:
                 addr = f"{p['ip']}:{p['port']}"
                 pipe.set(f"{PROXY_KEY_PREFIX}{addr}", json.dumps(p))
                 pipe.sadd(POOL_INDEX_KEY, addr)
+                pipe.sadd(HEALTHY_SET_KEY, addr)
             await pipe.execute()
 
     return {

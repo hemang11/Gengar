@@ -20,7 +20,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from pool import ProxyPool
+from pool import ProxyPool, DEAD_SET_KEY
 from strategies import (
     OnBlockStrategy,
     PerRequestStrategy,
@@ -241,11 +241,8 @@ async def pool_list(
 ):
     p = _get_pool()
     all_proxies = await p.get_all_proxies()
-    dead_set = await p.redis.smembers(DEAD_SET_KEY) if p.redis else set()
 
-    from pool import DEAD_SET_KEY
-
-    dead_addrs = await p.redis.smembers(DEAD_SET_KEY)
+    dead_addrs = await p.redis.smembers(DEAD_SET_KEY) if p.redis else set()
 
     for proxy in all_proxies:
         addr = f"{proxy['ip']}:{proxy['port']}"

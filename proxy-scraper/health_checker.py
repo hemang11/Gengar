@@ -26,7 +26,7 @@ logger = logging.getLogger("health-checker")
 
 # ── Config ───────────────────────────────────────────────────
 
-HEALTH_CHECK_URL = "http://httpbin.org/ip"
+HEALTH_CHECK_URL = "https://httpbin.org/ip"
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_CHECKS", "200"))
 TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "8"))
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "600"))
@@ -41,6 +41,7 @@ class _PoolAdapter:
     PROXY_KEY_PREFIX = "gengar:proxy:"
     POOL_INDEX_KEY = "gengar:pool:index"
     DEAD_SET_KEY = "gengar:pool:dead"
+    HEALTHY_SET_KEY = "gengar:pool:healthy"
 
     def __init__(self, redis: aioredis.Redis) -> None:
         self.redis = redis
@@ -53,11 +54,18 @@ class _PoolAdapter:
         return json.loads(raw) if raw else None
 
     async def save_proxy(self, proxy: dict) -> None:
-        key = f"{self.PROXY_KEY_PREFIX}{proxy['ip']}:{proxy['port']}"
+        addr = f"{proxy['ip']}:{proxy['port']}"
+        key = f"{self.PROXY_KEY_PREFIX}{addr}"
         await self.redis.set(key, json.dumps(proxy))
+        # Add to healthy set if we are saving it as healthy (called after success)
+        if proxy.get("consecutive_fails", 0) == 0:
+            await self.redis.sadd(self.HEALTHY_SET_KEY, addr)
+            await self.redis.srem(self.DEAD_SET_KEY, addr)
 
     async def mark_dead(self, ip: str, port: int) -> None:
-        await self.redis.sadd(self.DEAD_SET_KEY, f"{ip}:{port}")
+        addr = f"{ip}:{port}"
+        await self.redis.sadd(self.DEAD_SET_KEY, addr)
+        await self.redis.srem(self.HEALTHY_SET_KEY, addr)
 
     async def remove_proxy(self, ip: str, port: int) -> None:
         addr = f"{ip}:{port}"
@@ -65,6 +73,7 @@ class _PoolAdapter:
         pipe.delete(f"{self.PROXY_KEY_PREFIX}{addr}")
         pipe.srem(self.POOL_INDEX_KEY, addr)
         pipe.srem(self.DEAD_SET_KEY, addr)
+        pipe.srem(self.HEALTHY_SET_KEY, addr)
         await pipe.execute()
 
     async def is_dead(self, ip: str, port: int) -> bool:

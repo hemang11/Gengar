@@ -15,12 +15,17 @@ import os
 import signal
 import sys
 import time
-from urllib.parse import urlparse
+
 
 import httpx
 import redis.asyncio as aioredis
 
-from handler import handle_http_request, get_next_proxy
+from handler import (
+    handle_http_request,
+    get_next_proxy,
+    log_request_to_redis,
+    mark_proxy_blocked,
+)
 
 # ── Logging ──────────────────────────────────────────────────
 
@@ -116,66 +121,103 @@ async def handle_connect(
     port: int,
 ) -> None:
     """Handle HTTP CONNECT method for tunneling (HTTPS proxying)."""
-    try:
-        proxy_info = await get_next_proxy(rotation_client, target_domain=host)
-        if not proxy_info:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            await writer.drain()
-            return
-
-        proxy_ip = proxy_info["ip"]
-        proxy_port = proxy_info["port"]
-
-        # Connect to the upstream proxy
+    for attempt in range(1, 4):
         try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(proxy_ip, proxy_port),
-                timeout=10,
-            )
-        except Exception:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            await writer.drain()
-            return
-
-        # Send CONNECT to upstream proxy
-        upstream_writer.write(
-            f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
-        )
-        await upstream_writer.drain()
-
-        # Read upstream proxy response
-        resp_line = await asyncio.wait_for(upstream_reader.readline(), timeout=10)
-        resp_str = resp_line.decode("utf-8", errors="ignore").strip()
-
-        # Read until end of headers
-        while True:
-            line = await asyncio.wait_for(upstream_reader.readline(), timeout=10)
-            if line == b"\r\n" or line == b"\n" or not line:
+            proxy_info = await get_next_proxy(rotation_client, target_domain=host)
+            if not proxy_info:
                 break
 
-        if "200" in resp_str:
-            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await writer.drain()
+            proxy_ip = proxy_info["ip"]
+            proxy_port = proxy_info["port"]
 
-            # Bidirectional relay
-            await asyncio.gather(
-                _relay(reader, upstream_writer),
-                _relay(upstream_reader, writer),
-                return_exceptions=True,
+            # Connect to the upstream proxy
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_ip, proxy_port),
+                    timeout=10,
+                )
+            except Exception:
+                await mark_proxy_blocked(rotation_client, proxy_ip, proxy_port, host)
+                continue
+
+            # Send CONNECT to upstream proxy
+            upstream_writer.write(
+                f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
             )
-        else:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            await writer.drain()
+            await upstream_writer.drain()
 
-        upstream_writer.close()
+            # Read upstream proxy response
+            try:
+                resp_line = await asyncio.wait_for(
+                    upstream_reader.readline(), timeout=10
+                )
+                resp_str = resp_line.decode("utf-8", errors="ignore").strip()
 
-    except Exception as exc:
-        logger.debug(json.dumps({"event": "connect_error", "error": str(exc)}))
-        try:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            await writer.drain()
-        except Exception:
-            pass
+                # Read until end of headers
+                while True:
+                    line = await asyncio.wait_for(
+                        upstream_reader.readline(), timeout=10
+                    )
+                    if line == b"\r\n" or line == b"\n" or not line:
+                        break
+            except Exception:
+                upstream_writer.close()
+                await mark_proxy_blocked(rotation_client, proxy_ip, proxy_port, host)
+                continue
+
+            if "200" in resp_str:
+                # Log the CONNECT request
+                log_entry = {
+                    "ts": time.time(),
+                    "method": "CONNECT",
+                    "url": f"{host}:{port}",
+                    "target_domain": host,
+                    "proxy_ip": f"{proxy_ip}:{proxy_port}",
+                    "status": 200,
+                    "latency_ms": 0,
+                    "blocked": False,
+                    "attempt": attempt,
+                    "strategy": proxy_info.get("strategy", "unknown"),
+                }
+                asyncio.create_task(log_request_to_redis(redis_client, log_entry))
+
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+
+                # Bidirectional relay
+                await asyncio.gather(
+                    _relay(reader, upstream_writer),
+                    _relay(upstream_reader, writer),
+                    return_exceptions=True,
+                )
+                try:
+                    upstream_writer.close()
+                except Exception:
+                    pass
+                return
+            else:
+                upstream_writer.close()
+                await mark_proxy_blocked(rotation_client, proxy_ip, proxy_port, host)
+                continue
+
+        except Exception as exc:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "connect_error",
+                        "proxy": f"{proxy_ip}:{proxy_port}",
+                        "error": str(exc),
+                        "attempt": attempt,
+                    }
+                )
+            )
+            continue
+
+    try:
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await writer.drain()
+    except Exception:
+        pass
 
 
 async def _relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

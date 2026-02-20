@@ -17,6 +17,7 @@ import redis.asyncio as aioredis
 PROXY_KEY_PREFIX = "gengar:proxy:"
 POOL_INDEX_KEY = "gengar:pool:index"
 DEAD_SET_KEY = "gengar:pool:dead"
+HEALTHY_SET_KEY = "gengar:pool:healthy"
 SESSION_KEY_PREFIX = "gengar:session:"
 STATS_KEY = "gengar:stats"
 ROUND_ROBIN_KEY = "gengar:rr:index"
@@ -68,6 +69,9 @@ class ProxyPool:
         await self.redis.set(key, json.dumps(proxy))
         await self.redis.sadd(POOL_INDEX_KEY, f"{ip}:{port}")
         await self.redis.srem(DEAD_SET_KEY, f"{ip}:{port}")
+        # Only add to healthy set if it has some checks or we want to allow new ones as candidates
+        if proxy.get("health_score", 0) >= 0:
+            await self.redis.sadd(HEALTHY_SET_KEY, f"{ip}:{port}")
         return proxy
 
     async def bulk_add(self, proxies: list[dict]) -> int:
@@ -76,11 +80,13 @@ class ProxyPool:
         count = 0
         for p in proxies:
             ip, port = p["ip"], p["port"]
+            addr = f"{ip}:{port}"
             key = _proxy_key(ip, port)
             proxy = _default_proxy(ip, port, **p)
             pipe.set(key, json.dumps(proxy))
-            pipe.sadd(POOL_INDEX_KEY, f"{ip}:{port}")
-            pipe.srem(DEAD_SET_KEY, f"{ip}:{port}")
+            pipe.sadd(POOL_INDEX_KEY, addr)
+            pipe.srem(DEAD_SET_KEY, addr)
+            pipe.sadd(HEALTHY_SET_KEY, addr)
             count += 1
         await pipe.execute()
         return count
@@ -110,16 +116,27 @@ class ProxyPool:
 
     async def get_healthy_proxies(self, min_score: float = 0.0) -> list[dict]:
         """Return proxies with health_score > min_score and not dead."""
-        dead = await self.redis.smembers(DEAD_SET_KEY)
-        all_proxies = await self.get_all_proxies()
+        members = await self.redis.smembers(HEALTHY_SET_KEY)
+        if not members:
+            return []
+
+        pipe = self.redis.pipeline()
+        for m in members:
+            ip, port = m.rsplit(":", 1)
+            pipe.get(_proxy_key(ip, int(port)))
+        results = await pipe.execute()
+
         healthy = []
-        for p in all_proxies:
-            addr = f"{p['ip']}:{p['port']}"
-            if addr in dead:
+        for raw in results:
+            if not raw:
                 continue
+            p = json.loads(raw)
             if p.get("health_score", 0) >= min_score:
                 healthy.append(p)
-        healthy.sort(key=lambda x: (-x.get("health_score", 0), x.get("latency_ms", 9999)))
+
+        healthy.sort(
+            key=lambda x: (-x.get("health_score", 0), x.get("latency_ms", 9999))
+        )
         return healthy
 
     async def pool_size(self) -> int:
@@ -152,6 +169,8 @@ class ProxyPool:
         total = proxy["total_checks"]
         proxy["health_score"] = (proxy["success_count"] / total) * 100 if total else 0
         await self.redis.set(key, json.dumps(proxy))
+        await self.redis.sadd(HEALTHY_SET_KEY, f"{ip}:{port}")
+        await self.redis.srem(DEAD_SET_KEY, f"{ip}:{port}")
         return proxy
 
     async def record_failure(self, ip: str, port: int) -> dict:
@@ -166,7 +185,9 @@ class ProxyPool:
         proxy["consecutive_fails"] = proxy.get("consecutive_fails", 0) + 1
         proxy["last_checked"] = time.time()
         total = proxy["total_checks"]
-        proxy["health_score"] = (proxy.get("success_count", 0) / total) * 100 if total else 0
+        proxy["health_score"] = (
+            (proxy.get("success_count", 0) / total) * 100 if total else 0
+        )
         await self.redis.set(key, json.dumps(proxy))
 
         if proxy["consecutive_fails"] >= 3:
@@ -177,6 +198,7 @@ class ProxyPool:
         """Move a proxy to the dead set."""
         addr = f"{ip}:{port}"
         await self.redis.sadd(DEAD_SET_KEY, addr)
+        await self.redis.srem(HEALTHY_SET_KEY, addr)
 
     async def remove_proxy(self, ip: str, port: int) -> None:
         """Permanently remove a proxy from the pool."""
@@ -186,6 +208,7 @@ class ProxyPool:
         pipe.delete(key)
         pipe.srem(POOL_INDEX_KEY, addr)
         pipe.srem(DEAD_SET_KEY, addr)
+        pipe.srem(HEALTHY_SET_KEY, addr)
         await pipe.execute()
 
     async def flush_dead(self) -> int:
@@ -204,7 +227,9 @@ class ProxyPool:
 
     # ── Sessions ─────────────────────────────────────────────
 
-    async def set_session_proxy(self, session_id: str, proxy: dict, ttl: int = 300) -> None:
+    async def set_session_proxy(
+        self, session_id: str, proxy: dict, ttl: int = 300
+    ) -> None:
         """Pin a proxy to a session ID with TTL."""
         key = f"{SESSION_KEY_PREFIX}{session_id}"
         await self.redis.set(key, json.dumps(proxy), ex=ttl)
